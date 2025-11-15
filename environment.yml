@@ -1,0 +1,23 @@
+name: ik_lekiwi_so100
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.13
+  - pytorch>=2.0.0
+  - torchvision
+  - numpy>=1.24.0
+  - matplotlib>=3.7.0
+  - tqdm>=4.65.0
+  - opencv
+  - pillow>=10.0.0
+  - imageio
+  - imageio-ffmpeg
+  - psutil>=5.9.0
+  - pip
+  - pip:
+    - datasets>=2.14.0
+    - huggingface_hub>=0.19.0
+    - timm  # Required by cotracker
+    - einops  # Required by cotracker
