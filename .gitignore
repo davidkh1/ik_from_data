@@ -5,6 +5,9 @@ output/
 *.dat
 *.log
 
+# Weights & Biases
+wandb/
+
 # Python
 __pycache__/
 *.py[cod]
