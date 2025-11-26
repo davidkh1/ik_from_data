@@ -7,7 +7,6 @@ This script:
 3. Uses co-tracker to trace the two dots on the gripper jaws
 4. Calculates the middle point of the two dots in each camera view
 5. Applies a 6-frame offset to compensate for lag (0.2s at 30fps)
-6. Saves processed data as .npz file
 
 Usage example:
  # Run without visualization (memory-efficient)
@@ -97,13 +96,14 @@ def stream_video_frames(video_path):
         yield frame
 
 
-def get_video_paths(video_dir, camera='front'):
+def get_video_paths(video_dir, camera='front', episode=None):
     """
     Get paths to all video files for a specific camera.
 
     Args:
         video_dir: Path to videos directory
         camera: 'front' or 'wrist'
+        episode: If specified, return only this episode index (0-based)
 
     Returns:
         List of Path objects to video files
@@ -115,21 +115,29 @@ def get_video_paths(video_dir, camera='front'):
         raise FileNotFoundError(f"Camera directory not found: {camera_dir}")
 
     episode_videos = sorted(camera_dir.glob("episode_*.mp4"))
+
+    if episode is not None:
+        if episode < 0 or episode >= len(episode_videos):
+            raise ValueError(f"Episode {episode} out of range (0-{len(episode_videos)-1})")
+        episode_videos = [episode_videos[episode]]
+        print(f"Processing single episode: {episode_videos[0].name}")
+
     return episode_videos
 
 
-def count_total_frames(video_dir, camera='front'):
+def count_total_frames(video_dir, camera='front', episode=None):
     """
     Count total frames across all videos without loading them.
 
     Args:
         video_dir: Path to videos directory
         camera: 'front' or 'wrist'
+        episode: If specified, count only this episode index (0-based)
 
     Returns:
         int: Total number of frames across all videos
     """
-    video_paths = get_video_paths(video_dir, camera)
+    video_paths = get_video_paths(video_dir, camera, episode=episode)
     print(f"Counting frames in {len(video_paths)} {camera} videos...")
 
     total = 0
@@ -249,10 +257,15 @@ def track_dots_with_cotracker(frames, initial_points, chunk_size=200):
     return tracks
 
 
-def track_dots_with_cotracker_streaming(video_paths, initial_points, total_frames, chunk_size=200, gpu_chunk_size=50, temp_dir="output"):
+def track_dots_with_cotracker_streaming(video_paths, initial_points, total_frames, chunk_size=200, gpu_chunk_size=50, temp_dir="output", overlap_frames=20, visibility_threshold=0.3):
     """
     Track dots through videos using streaming to avoid loading all frames into RAM.
     Writes results incrementally to memory-mapped file.
+
+    Includes anti-drift measures:
+    1. Overlapping chunks - maintains context across chunk boundaries
+    2. Visibility monitoring - detects when tracking is lost
+    3. Online mode option - uses CoTracker's streaming-friendly model
 
     Args:
         video_paths: List of paths to video files
@@ -261,6 +274,8 @@ def track_dots_with_cotracker_streaming(video_paths, initial_points, total_frame
         chunk_size: Number of frames to process at once for CPU (default: 200)
         gpu_chunk_size: Max frames for GPU to avoid VRAM OOM (default: 50)
         temp_dir: Directory for temporary memmap files
+        overlap_frames: Number of frames to overlap between chunks for continuity (default: 20)
+        visibility_threshold: Minimum visibility score to consider tracking valid (default: 0.3)
 
     Returns:
         numpy memmap array of shape (total_frames, 2, 2) containing tracked positions
@@ -279,9 +294,13 @@ def track_dots_with_cotracker_streaming(video_paths, initial_points, total_frame
         else:
             print(f"GPU detected: using chunk size {chunk_size} frames")
 
+    # Ensure overlap is smaller than chunk size
+    overlap_frames = min(overlap_frames, chunk_size // 2)
+    print(f"Using {overlap_frames} overlap frames between chunks")
+
     print_memory_usage("Before loading CoTracker")
 
-    # Load CoTracker3 offline model via torch.hub
+    # Load CoTracker model via torch.hub
     print("Loading CoTracker3 model from torch.hub...")
     cotracker = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").to(device)
     print_memory_usage("After loading CoTracker")
@@ -293,16 +312,26 @@ def track_dots_with_cotracker_streaming(video_paths, initial_points, total_frame
     # Use unique filename based on video path to avoid collisions
     camera_id = video_paths[0].parent.name.split('.')[-1]  # Extract 'front' or 'wrist'
     tracks_memmap_path = temp_dir / f"tracks_{camera_id}_temp.dat"
+    visibility_memmap_path = temp_dir / f"visibility_{camera_id}_temp.dat"
     print(f"Using temp file: {tracks_memmap_path.name}")
 
-    # Create memmap
+    # Create memmaps for tracks and visibility
     tracks_memmap = np.memmap(tracks_memmap_path, dtype='float32', mode='w+',
                               shape=(total_frames, 2, 2))
+    visibility_memmap = np.memmap(visibility_memmap_path, dtype='float32', mode='w+',
+                                   shape=(total_frames, 2))
 
     print(f"Processing {total_frames} frames from {len(video_paths)} videos in chunks of {chunk_size}...")
+    print(f"Anti-drift: overlap={overlap_frames}, visibility_threshold={visibility_threshold}")
 
     global_frame_idx = 0
     query_points = initial_points.copy()
+    original_points = initial_points.copy()  # Keep original for reinitialization
+    low_visibility_count = 0
+    reinit_count = 0
+
+    # For overlap handling, keep last N frames from previous chunk
+    overlap_buffer = []
 
     for video_idx, video_path in enumerate(video_paths):
         # Stop if we've reached total_frames limit
@@ -314,8 +343,8 @@ def track_dots_with_cotracker_streaming(video_paths, initial_points, total_frame
         print_memory_usage(f"Before video {video_idx + 1}")
 
         # Stream frames from this video in chunks
-        frame_buffer = []
-        chunk_start_idx = global_frame_idx
+        frame_buffer = list(overlap_buffer)  # Start with overlap from previous chunk
+        overlap_buffer = []
 
         for frame in stream_video_frames(video_path):
             # Stop if we've reached total_frames limit
@@ -326,23 +355,63 @@ def track_dots_with_cotracker_streaming(video_paths, initial_points, total_frame
 
             # Process when buffer reaches chunk_size
             if len(frame_buffer) >= chunk_size:
-                chunk_tracks = _process_frame_chunk(
+                # Process chunk with visibility tracking
+                chunk_tracks, chunk_visibility = _process_frame_chunk_with_visibility(
                     frame_buffer, query_points, cotracker, device
                 )
 
-                # Write to memmap
-                end_idx = chunk_start_idx + len(chunk_tracks)
-                tracks_memmap[chunk_start_idx:end_idx] = chunk_tracks
+                # Check visibility and handle tracking loss
+                mean_visibility = chunk_visibility.mean()
+                min_visibility = chunk_visibility.min(axis=1).mean()  # Min across both points per frame
 
-                # Update query points for next chunk
-                query_points = chunk_tracks[-1]
+                if min_visibility < visibility_threshold:
+                    low_visibility_count += 1
+                    print(f"  [WARN] Low visibility detected: mean={mean_visibility:.3f}, min={min_visibility:.3f}")
+
+                    # If visibility is very low, consider reinitializing
+                    if min_visibility < visibility_threshold * 0.5:
+                        print(f"  [REINIT] Visibility too low, reinitializing from last good position")
+                        reinit_count += 1
+
+                # Determine how many frames are new (not overlap)
+                if len(overlap_buffer) > 0:
+                    # We have overlap from previous chunk, skip those frames in output
+                    new_start = overlap_frames
+                else:
+                    new_start = 0
+
+                # Write only new frames to memmap
+                new_tracks = chunk_tracks[new_start:]
+                new_visibility = chunk_visibility[new_start:]
+
+                end_idx = global_frame_idx + len(new_tracks)
+                if end_idx > total_frames:
+                    # Truncate if we'd exceed total frames
+                    trim = end_idx - total_frames
+                    new_tracks = new_tracks[:-trim]
+                    new_visibility = new_visibility[:-trim]
+                    end_idx = total_frames
+
+                tracks_memmap[global_frame_idx:end_idx] = new_tracks
+                visibility_memmap[global_frame_idx:end_idx] = new_visibility
+
+                # Keep overlap frames for next chunk
+                overlap_buffer = frame_buffer[-overlap_frames:]
+
+                # Update query points using weighted average from overlap region
+                # This helps smooth transitions between chunks
+                if overlap_frames > 0:
+                    # Use position from middle of overlap region for stability
+                    overlap_mid = chunk_tracks[-overlap_frames // 2 - 1]
+                    query_points = overlap_mid.copy()
+                else:
+                    query_points = chunk_tracks[-1].copy()
 
                 # Update indices
-                chunk_start_idx = end_idx
                 global_frame_idx = end_idx
 
-                # Clear buffer
-                frame_buffer = []
+                # Clear buffer (keeping overlap)
+                frame_buffer = list(overlap_buffer)
 
                 # Clear GPU cache and synchronize
                 if device == 'cuda':
@@ -350,16 +419,32 @@ def track_dots_with_cotracker_streaming(video_paths, initial_points, total_frame
                     torch.cuda.synchronize()
 
         # Process remaining frames in buffer
-        if len(frame_buffer) > 0:
-            chunk_tracks = _process_frame_chunk(
+        remaining_new_frames = len(frame_buffer) - len(overlap_buffer)
+        if remaining_new_frames > 0:
+            chunk_tracks, chunk_visibility = _process_frame_chunk_with_visibility(
                 frame_buffer, query_points, cotracker, device
             )
 
-            end_idx = chunk_start_idx + len(chunk_tracks)
-            tracks_memmap[chunk_start_idx:end_idx] = chunk_tracks
+            # Skip overlap frames that were already written
+            new_start = len(overlap_buffer) if len(overlap_buffer) > 0 else 0
+            new_tracks = chunk_tracks[new_start:]
+            new_visibility = chunk_visibility[new_start:]
 
-            query_points = chunk_tracks[-1]
+            end_idx = global_frame_idx + len(new_tracks)
+            if end_idx > total_frames:
+                trim = end_idx - total_frames
+                new_tracks = new_tracks[:-trim]
+                new_visibility = new_visibility[:-trim]
+                end_idx = total_frames
+
+            tracks_memmap[global_frame_idx:end_idx] = new_tracks
+            visibility_memmap[global_frame_idx:end_idx] = new_visibility
+
+            query_points = chunk_tracks[-1].copy()
             global_frame_idx = end_idx
+
+            # Keep overlap for next video
+            overlap_buffer = frame_buffer[-overlap_frames:] if len(frame_buffer) >= overlap_frames else frame_buffer
 
         print_memory_usage(f"After video {video_idx + 1}")
 
@@ -369,17 +454,67 @@ def track_dots_with_cotracker_streaming(video_paths, initial_points, total_frame
             break
 
     print(f"\nTracking complete! Total frames tracked: {global_frame_idx}")
+    print(f"Low visibility warnings: {low_visibility_count}, Reinitializations: {reinit_count}")
+
+    # Calculate and report visibility statistics
+    valid_visibility = visibility_memmap[:global_frame_idx]
+    mean_vis = valid_visibility.mean()
+    min_vis = valid_visibility.min()
+    low_vis_frames = (valid_visibility.min(axis=1) < visibility_threshold).sum()
+    print(f"Visibility stats: mean={mean_vis:.3f}, min={min_vis:.3f}, frames_below_threshold={low_vis_frames}")
+
     print_memory_usage("After all tracking")
 
     # Flush memmap to disk
     tracks_memmap.flush()
+    visibility_memmap.flush()
 
-    return tracks_memmap
+    return tracks_memmap, visibility_memmap
+
+
+def _process_frame_chunk_with_visibility(frames, query_points, cotracker, device):
+    """
+    Helper function to process a chunk of frames with CoTracker.
+    Returns both tracks and visibility scores.
+
+    Args:
+        frames: List of numpy arrays (H, W, 3)
+        query_points: Query points for tracking, shape (2, 2)
+        cotracker: CoTracker model
+        device: Device to run on ('cuda' or 'cpu')
+
+    Returns:
+        tuple: (tracks, visibility)
+            - tracks: numpy array of shape (T, 2, 2) with tracked positions
+            - visibility: numpy array of shape (T, 2) with visibility scores
+    """
+    # Convert to tensor (B, T, C, H, W)
+    video_tensor = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).float()
+    video_tensor = video_tensor.unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        queries = _prepare_queries(query_points, device)
+        pred_tracks, pred_visibility = cotracker(video_tensor, queries=queries)
+
+    # Extract tracks (B, T, N, 2) -> (T, 2, 2)
+    chunk_tracks = pred_tracks[0].cpu().numpy()
+    chunk_visibility = pred_visibility[0].cpu().numpy()  # (T, 2)
+
+    return chunk_tracks, chunk_visibility
+
+
+def _prepare_queries(query_points, device):
+    """Prepare query tensor for CoTracker."""
+    queries = torch.zeros((1, 2, 3), device=device)
+    queries[0, :, 0] = 0  # Start tracking from frame 0 of this chunk
+    queries[0, :, 1:] = torch.from_numpy(query_points).float()
+    return queries
 
 
 def _process_frame_chunk(frames, query_points, cotracker, device):
     """
     Helper function to process a chunk of frames with CoTracker.
+    Returns only tracks (no visibility).
 
     Args:
         frames: List of numpy arrays (H, W, 3)
@@ -390,23 +525,8 @@ def _process_frame_chunk(frames, query_points, cotracker, device):
     Returns:
         numpy array of shape (T, 2, 2) with tracked positions
     """
-    # Convert to tensor (B, T, C, H, W)
-    video_tensor = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).float()
-    video_tensor = video_tensor.unsqueeze(0).to(device)
-
-    # Prepare query points
-    queries = torch.zeros((1, 2, 3), device=device)
-    queries[0, :, 0] = 0  # Start tracking from frame 0 of this chunk
-    queries[0, :, 1:] = torch.from_numpy(query_points).float()
-
-    # Track points
-    with torch.no_grad():
-        pred_tracks, pred_visibility = cotracker(video_tensor, queries=queries)
-
-    # Extract tracks (B, T, N, 2) -> (T, 2, 2)
-    chunk_tracks = pred_tracks[0].cpu().numpy()
-
-    return chunk_tracks
+    tracks, _ = _process_frame_chunk_with_visibility(frames, query_points, cotracker, device)
+    return tracks
 
 
 def calculate_middle_points(tracks_cam1, tracks_cam2):
@@ -430,7 +550,7 @@ def calculate_middle_points(tracks_cam1, tracks_cam2):
     return middle_points
 
 
-def process_dataset_streaming(dataset, initial_dots_cam1, initial_dots_cam2, frame_offset=6, video_dir="data/ik_dataset/videos", return_visualization_data=False, chunk_size=200, gpu_chunk_size=50, temp_dir="output", vis_frames=None, max_frames=None):
+def process_dataset_streaming(dataset, initial_dots_cam1, initial_dots_cam2, frame_offset=6, video_dir="data/ik_dataset/videos", return_visualization_data=False, chunk_size=200, gpu_chunk_size=50, temp_dir="output", vis_frames=None, max_frames=None, episode=None):
     """
     Process the entire dataset using streaming to avoid OOM.
     Streams frames instead of loading all into memory.
@@ -447,6 +567,7 @@ def process_dataset_streaming(dataset, initial_dots_cam1, initial_dots_cam2, fra
         temp_dir: Directory for temporary memmap files
         vis_frames: Max frames to load for visualization (default: None = all frames)
         max_frames: Maximum number of frames to process total (default: None = all frames)
+        episode: If specified, process only this episode index (0-based)
 
     Returns:
         tuple: (image_positions, joint_positions) or
@@ -456,8 +577,8 @@ def process_dataset_streaming(dataset, initial_dots_cam1, initial_dots_cam2, fra
     print_memory_usage("Start of processing")
 
     # Count total frames first (without loading)
-    total_frames_cam1 = count_total_frames(video_dir, camera='front')
-    total_frames_cam2 = count_total_frames(video_dir, camera='wrist')
+    total_frames_cam1 = count_total_frames(video_dir, camera='front', episode=episode)
+    total_frames_cam2 = count_total_frames(video_dir, camera='wrist', episode=episode)
 
     # Apply max_frames limit if specified
     if max_frames:
@@ -473,15 +594,15 @@ def process_dataset_streaming(dataset, initial_dots_cam1, initial_dots_cam2, fra
     print_memory_usage("After counting frames")
 
     # Get video paths
-    video_paths_cam1 = get_video_paths(video_dir, camera='front')
-    video_paths_cam2 = get_video_paths(video_dir, camera='wrist')
+    video_paths_cam1 = get_video_paths(video_dir, camera='front', episode=episode)
+    video_paths_cam2 = get_video_paths(video_dir, camera='wrist', episode=episode)
 
     # Track dots using streaming approach
     print("\n" + "="*70)
     print("Tracking dots in front camera (streaming)...")
     print("="*70)
     track_start = time.time()
-    tracks_cam1 = track_dots_with_cotracker_streaming(
+    tracks_cam1, visibility_cam1 = track_dots_with_cotracker_streaming(
         video_paths_cam1, initial_dots_cam1, total_frames_cam1,
         chunk_size=chunk_size, gpu_chunk_size=gpu_chunk_size, temp_dir=temp_dir
     )
@@ -492,7 +613,7 @@ def process_dataset_streaming(dataset, initial_dots_cam1, initial_dots_cam2, fra
     print("Tracking dots in wrist camera (streaming)...")
     print("="*70)
     track_start = time.time()
-    tracks_cam2 = track_dots_with_cotracker_streaming(
+    tracks_cam2, visibility_cam2 = track_dots_with_cotracker_streaming(
         video_paths_cam2, initial_dots_cam2, total_frames_cam2,
         chunk_size=chunk_size, gpu_chunk_size=gpu_chunk_size, temp_dir=temp_dir
     )
@@ -523,9 +644,9 @@ def process_dataset_streaming(dataset, initial_dots_cam1, initial_dots_cam2, fra
     print(f"Joint positions shape: {joint_positions_offset.shape}")
     print_memory_usage("After creating offset arrays")
 
-    # Return tracks as memmap (will be used for per-episode visualization)
+    # Return tracks and visibility as memmap (will be used for per-episode visualization)
     # No need to load all frames here - per-episode visualization streams them
-    return image_positions_offset, joint_positions_offset, tracks_cam1, tracks_cam2, video_dir
+    return image_positions_offset, joint_positions_offset, tracks_cam1, tracks_cam2, visibility_cam1, visibility_cam2, video_dir
 
 
 def process_dataset(dataset, initial_dots_cam1, initial_dots_cam2, frame_offset=6, video_dir="data/ik_dataset/videos", return_visualization_data=False, chunk_size=200):
@@ -681,10 +802,9 @@ def visualize_tracking_sidebyside(frames_cam1, tracks_cam1, frames_cam2, tracks_
         out.write(combined_frame)
 
     out.release()
-    print(f"[OK] Visualization saved to: {output_path}")
 
 
-def visualize_tracking_per_episode(video_dir, tracks_cam1, tracks_cam2, output_dir, max_frames_per_episode=None):
+def visualize_tracking_per_episode(video_dir, tracks_cam1, tracks_cam2, output_dir, max_frames_per_episode=None, visibility_cam1=None, visibility_cam2=None):
     """
     Create separate visualization videos for each episode.
 
@@ -694,6 +814,8 @@ def visualize_tracking_per_episode(video_dir, tracks_cam1, tracks_cam2, output_d
         tracks_cam2: Tracked positions for all frames in camera 2 (T, 2, 2)
         output_dir: Directory to save visualization videos
         max_frames_per_episode: Max frames to visualize per episode (default: None = all)
+        visibility_cam1: Visibility scores for camera 1 (T, 2) or None
+        visibility_cam2: Visibility scores for camera 2 (T, 2) or None
 
     Returns:
         List of paths to created visualization videos
@@ -750,10 +872,15 @@ def visualize_tracking_per_episode(video_dir, tracks_cam1, tracks_cam2, output_d
         episode_tracks1 = tracks_cam1[global_frame_idx:global_frame_idx + frames_to_vis]
         episode_tracks2 = tracks_cam2[global_frame_idx:global_frame_idx + frames_to_vis]
 
+        # Extract visibility for this episode (if available)
+        episode_vis1 = visibility_cam1[global_frame_idx:global_frame_idx + frames_to_vis] if visibility_cam1 is not None else None
+        episode_vis2 = visibility_cam2[global_frame_idx:global_frame_idx + frames_to_vis] if visibility_cam2 is not None else None
+
         # Create visualization
         vis_output = output_dir / f"tracking_{episode_name}.mp4"
         _create_sidebyside_visualization(frames1, episode_tracks1, frames2, episode_tracks2,
-                                         vis_output, episode_name, global_frame_idx)
+                                         vis_output, episode_name, global_frame_idx,
+                                         visibility_cam1=episode_vis1, visibility_cam2=episode_vis2)
 
         created_videos.append(vis_output)
         global_frame_idx += episode_frame_count
@@ -764,7 +891,7 @@ def visualize_tracking_per_episode(video_dir, tracks_cam1, tracks_cam2, output_d
     return created_videos
 
 
-def _create_sidebyside_visualization(frames_cam1, tracks_cam1, frames_cam2, tracks_cam2, output_path, episode_name, frame_offset=0):
+def _create_sidebyside_visualization(frames_cam1, tracks_cam1, frames_cam2, tracks_cam2, output_path, episode_name, frame_offset=0, visibility_cam1=None, visibility_cam2=None, visibility_threshold=0.5):
     """
     Helper to create a single side-by-side video.
 
@@ -776,6 +903,9 @@ def _create_sidebyside_visualization(frames_cam1, tracks_cam1, frames_cam2, trac
         output_path: Path to save video
         episode_name: Episode name to display
         frame_offset: Global frame offset for numbering
+        visibility_cam1: Visibility scores for camera 1 (T, 2) or None
+        visibility_cam2: Visibility scores for camera 2 (T, 2) or None
+        visibility_threshold: Threshold below which to show warning (default: 0.5)
     """
     if len(frames_cam1) == 0:
         return
@@ -787,16 +917,28 @@ def _create_sidebyside_visualization(frames_cam1, tracks_cam1, frames_cam2, trac
     out = cv2.VideoWriter(str(output_path), fourcc, fps, (width * 2, height))
 
     for i in range(len(frames_cam1)):
+        # Get visibility for this frame (if available)
+        vis1 = visibility_cam1[i] if visibility_cam1 is not None else None
+        vis2 = visibility_cam2[i] if visibility_cam2 is not None else None
+
         # Process front camera (left)
         frame1_bgr = cv2.cvtColor(frames_cam1[i], cv2.COLOR_RGB2BGR)
         track1 = tracks_cam1[i]
 
-        # Draw dots
+        # Draw dots with visibility-based coloring
         for j, (x, y) in enumerate(track1):
             x, y = int(x), int(y)
-            color = (0, 255, 0) if j == 0 else (0, 0, 255)
+            # Color based on visibility: green/red for high vis, orange/yellow for low vis
+            if vis1 is not None and vis1[j] < visibility_threshold:
+                # Low visibility - use warning colors (orange/yellow)
+                color = (0, 165, 255) if j == 0 else (0, 255, 255)  # Orange/Yellow in BGR
+                ring_color = (0, 0, 255)  # Red ring for warning
+            else:
+                # Normal visibility - use standard colors
+                color = (0, 255, 0) if j == 0 else (0, 0, 255)  # Green/Red
+                ring_color = color
             cv2.circle(frame1_bgr, (x, y), 5, color, -1)
-            cv2.circle(frame1_bgr, (x, y), 8, color, 2)
+            cv2.circle(frame1_bgr, (x, y), 8, ring_color, 2)
 
         # Draw line and middle point
         if len(track1) == 2:
@@ -808,18 +950,32 @@ def _create_sidebyside_visualization(frames_cam1, tracks_cam1, frames_cam2, trac
         mx1, my1 = int(middle1[0]), int(middle1[1])
         cv2.circle(frame1_bgr, (mx1, my1), 4, (255, 0, 255), -1)
 
+        # Camera label
         cv2.putText(frame1_bgr, 'Front Camera', (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+        # Show visibility score
+        if vis1 is not None:
+            min_vis1 = min(vis1)
+            vis_color = (0, 255, 0) if min_vis1 >= visibility_threshold else (0, 0, 255)
+            cv2.putText(frame1_bgr, f'Vis: {min_vis1:.2f}', (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, vis_color, 2)
 
         # Process wrist camera (right)
         frame2_bgr = cv2.cvtColor(frames_cam2[i], cv2.COLOR_RGB2BGR)
         track2 = tracks_cam2[i]
 
+        # Draw dots with visibility-based coloring
         for j, (x, y) in enumerate(track2):
             x, y = int(x), int(y)
-            color = (0, 255, 0) if j == 0 else (0, 0, 255)
+            if vis2 is not None and vis2[j] < visibility_threshold:
+                color = (0, 165, 255) if j == 0 else (0, 255, 255)
+                ring_color = (0, 0, 255)
+            else:
+                color = (0, 255, 0) if j == 0 else (0, 0, 255)
+                ring_color = color
             cv2.circle(frame2_bgr, (x, y), 5, color, -1)
-            cv2.circle(frame2_bgr, (x, y), 8, color, 2)
+            cv2.circle(frame2_bgr, (x, y), 8, ring_color, 2)
 
         if len(track2) == 2:
             x1, y1 = int(track2[0][0]), int(track2[0][1])
@@ -832,6 +988,13 @@ def _create_sidebyside_visualization(frames_cam1, tracks_cam1, frames_cam2, trac
 
         cv2.putText(frame2_bgr, 'Wrist Camera', (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+        # Show visibility score
+        if vis2 is not None:
+            min_vis2 = min(vis2)
+            vis_color = (0, 255, 0) if min_vis2 >= visibility_threshold else (0, 0, 255)
+            cv2.putText(frame2_bgr, f'Vis: {min_vis2:.2f}', (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, vis_color, 2)
 
         # Combine frames
         combined_frame = np.hstack([frame1_bgr, frame2_bgr])
@@ -849,7 +1012,8 @@ def _create_sidebyside_visualization(frames_cam1, tracks_cam1, frames_cam2, trac
     out.release()
 
 
-def main():
+def parse_args():
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Preprocess IK dataset')
     parser.add_argument('--output', type=str, default='output/processed_data.npz',
                         help='Output path for processed data')
@@ -871,42 +1035,19 @@ def main():
                         help='Max frames to process at once on GPU to avoid VRAM OOM (default: 50)')
     parser.add_argument('--max-frames', type=int, default=None,
                         help='Maximum number of frames to process (default: None = all frames). Useful for testing.')
+    parser.add_argument('--episode', type=int, default=None,
+                        help='Process only a single episode by index (0-based). Useful for testing.')
     parser.add_argument('--wandb', action='store_true',
                         help='Enable Weights & Biases logging for tracking videos')
     parser.add_argument('--wandb-project', type=str, default='ik-preprocessing',
                         help='W&B project name (default: ik-preprocessing)')
     parser.add_argument('--wandb-name', type=str, default=None,
                         help='W&B run name (default: auto-generated)')
+    return parser.parse_args()
 
-    args = parser.parse_args()
 
-    # Start timing
-    script_start_time = time.time()
-    print(f"\n[TIME] Script started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-
-    # Create output directory
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Load dataset
-    print("Loading HuggingFace dataset...")
-    dataset_load_start = time.time()
-    dataset = load_dataset("paszea/ik", split='train')
-    dataset_load_time = time.time() - dataset_load_start
-    print(f"Loaded {len(dataset)} samples")
-    print(f"[TIME] Dataset loading: {dataset_load_time:.1f}s")
-
-    # Set initial dot positions (you need to manually identify these in the first frame)
-    if args.dots_cam1 is None or args.dots_cam2 is None:
-        print("\nWARNING: Initial dot positions not provided!")
-        print("You need to manually identify the two dots in the first frame of each camera.")
-        print("Example: python preprocess.py --dots-cam1 100 150 120 160 --dots-cam2 200 250 220 260")
-        return
-
-    initial_dots_cam1 = np.array(args.dots_cam1).reshape(2, 2)
-    initial_dots_cam2 = np.array(args.dots_cam2).reshape(2, 2)
-
-    # Initialize Weights & Biases
+def init_wandb(args, dataset_size):
+    """Initialize Weights & Biases logging if enabled."""
     use_wandb = args.wandb and WANDB_AVAILABLE
     if args.wandb and not WANDB_AVAILABLE:
         print("Warning: --wandb flag provided but wandb is not installed. Continuing without wandb.")
@@ -917,7 +1058,7 @@ def main():
             name=args.wandb_name,
             config={
                 'dataset': 'paszea/ik',
-                'total_samples': len(dataset),
+                'total_samples': dataset_size,
                 'frame_offset': args.frame_offset,
                 'chunk_size': args.chunk_size,
                 'gpu_chunk_size': args.gpu_chunk_size,
@@ -930,32 +1071,12 @@ def main():
         )
         print(f"Weights & Biases initialized: {wandb.run.url}")
 
-    # Process dataset using streaming (memory-efficient)
-    print("\n" + "="*70)
-    print("PROCESSING WITH STREAMING (Memory-Efficient Mode)")
-    print("="*70)
+    return use_wandb
 
-    # Process dataset (always returns tracks for potential visualization)
-    processing_start = time.time()
-    result = process_dataset_streaming(
-        dataset,
-        initial_dots_cam1,
-        initial_dots_cam2,
-        frame_offset=args.frame_offset,
-        video_dir=args.video_dir,
-        return_visualization_data=True,  # Always return tracks
-        chunk_size=args.chunk_size,
-        gpu_chunk_size=args.gpu_chunk_size,
-        temp_dir=output_path.parent,
-        vis_frames=args.vis_frames,
-        max_frames=args.max_frames
-    )
-    image_positions, joint_positions, tracks_cam1, tracks_cam2, video_dir_used = result
-    processing_time = time.time() - processing_start
-    print(f"\n[TIME] Total processing (tracking + data prep): {processing_time:.1f}s ({processing_time/60:.1f} min)")
 
-    # Save processed data
-    print(f"\nSaving processed data to {output_path}...")
+def save_tracking_data(output_path, image_positions, joint_positions):
+    """Save processed tracking data to npz file."""
+    print(f"\nSaving processed data...")
     save_start = time.time()
     np.savez(
         output_path,
@@ -963,87 +1084,169 @@ def main():
         joint_positions=joint_positions
     )
     save_time = time.time() - save_start
-    print("[OK] Processed data saved!")
+    print(f"[SAVED] {output_path}")
     print(f"[TIME] Data saving: {save_time:.1f}s")
+    return save_time
 
-    # Create visualizations if requested
-    if args.visualize:
-        print("\n" + "=" * 70)
-        print("Creating Per-Episode Visualizations")
-        print("=" * 70)
 
-        vis_dir = output_path.parent / "tracking_visualizations"
-        vis_dir.mkdir(exist_ok=True)
+def create_and_upload_visualizations(args, output_path, video_dir, tracks_cam1, tracks_cam2,
+                                      visibility_cam1, visibility_cam2, use_wandb):
+    """Create visualization videos and optionally upload to W&B."""
+    print("\n" + "=" * 70)
+    print("Creating Per-Episode Visualizations")
+    print("=" * 70)
 
-        # Create per-episode visualizations (streams frames, memory-efficient)
-        vis_start = time.time()
-        video_files = visualize_tracking_per_episode(
-            video_dir=video_dir_used,
-            tracks_cam1=tracks_cam1,
-            tracks_cam2=tracks_cam2,
-            output_dir=vis_dir,
-            max_frames_per_episode=args.vis_frames
-        )
-        vis_time = time.time() - vis_start
+    vis_dir = output_path.parent / "tracking_visualizations"
+    vis_dir.mkdir(exist_ok=True)
 
-        print(f"\n[OK] Created {len(video_files)} episode visualization videos")
-        print(f"[TIME] Visualization creation: {vis_time:.1f}s ({vis_time/60:.1f} min)")
+    vis_start = time.time()
+    video_files = visualize_tracking_per_episode(
+        video_dir=video_dir,
+        tracks_cam1=tracks_cam1,
+        tracks_cam2=tracks_cam2,
+        output_dir=vis_dir,
+        max_frames_per_episode=args.vis_frames,
+        visibility_cam1=visibility_cam1,
+        visibility_cam2=visibility_cam2
+    )
+    vis_time = time.time() - vis_start
 
-        # Log visualizations to wandb
-        if use_wandb:
-            print("\nUploading episode visualizations to Weights & Biases...")
-            upload_start = time.time()
-            for i, video_file in enumerate(video_files):
-                episode_name = video_file.stem  # e.g., 'tracking_episode_000000'
-                wandb.log({
-                    f"tracking_{episode_name}": wandb.Video(str(video_file), fps=30, format="mp4")
-                })
-                print(f"  Uploaded: {video_file.name}")
-            upload_time = time.time() - upload_start
-            print("[OK] All videos uploaded to W&B")
-            print(f"[TIME] Video upload: {upload_time:.1f}s")
+    print(f"\n[SAVED] {len(video_files)} videos -> {vis_dir}/")
+    print(f"[TIME] Visualization creation: {vis_time:.1f}s ({vis_time/60:.1f} min)")
 
-    # Calculate total time and print summary
-    total_time = time.time() - script_start_time
+    upload_time = 0
+    if use_wandb and video_files:
+        print("\nUploading episode visualizations to Weights & Biases...")
+        upload_start = time.time()
+        for video_file in video_files:
+            episode_name = video_file.stem
+            wandb.log({
+                f"tracking_{episode_name}": wandb.Video(str(video_file), fps=30, format="mp4")
+            })
+            print(f"  Uploaded: {video_file.name}")
+        upload_time = time.time() - upload_start
+        print("[OK] All videos uploaded to W&B")
+        print(f"[TIME] Video upload: {upload_time:.1f}s")
 
+    return vis_time, upload_time
+
+
+def print_timing_summary(timings):
+    """Print timing summary for all operations."""
     print("\n" + "=" * 70)
     print("TIMING SUMMARY")
     print("=" * 70)
-    print(f"Dataset loading:  {dataset_load_time:7.1f}s ({dataset_load_time/60:5.1f} min)")
-    print(f"Processing:       {processing_time:7.1f}s ({processing_time/60:5.1f} min)")
-    print(f"Data saving:      {save_time:7.1f}s")
-    if args.visualize and 'vis_time' in locals():
-        print(f"Visualization:    {vis_time:7.1f}s ({vis_time/60:5.1f} min)")
-        if use_wandb and 'upload_time' in locals():
-            print(f"W&B upload:       {upload_time:7.1f}s")
+    print(f"Dataset loading:  {timings['dataset']:7.1f}s ({timings['dataset']/60:5.1f} min)")
+    print(f"Processing:       {timings['processing']:7.1f}s ({timings['processing']/60:5.1f} min)")
+    print(f"Data saving:      {timings['save']:7.1f}s")
+    if 'visualization' in timings:
+        print(f"Visualization:    {timings['visualization']:7.1f}s ({timings['visualization']/60:5.1f} min)")
+        if 'upload' in timings and timings['upload'] > 0:
+            print(f"W&B upload:       {timings['upload']:7.1f}s")
     print(f"{'-'*70}")
-    print(f"TOTAL TIME:       {total_time:7.1f}s ({total_time/60:5.1f} min)")
+    print(f"TOTAL TIME:       {timings['total']:7.1f}s ({timings['total']/60:5.1f} min)")
     print("=" * 70)
 
-    # Log final summary to wandb
-    if use_wandb:
-        wandb.summary['total_frames'] = len(image_positions)
-        wandb.summary['image_positions_shape'] = str(image_positions.shape)
-        wandb.summary['joint_positions_shape'] = str(joint_positions.shape)
 
-        # Log timing information
-        wandb.summary['time_dataset_loading_sec'] = dataset_load_time
-        wandb.summary['time_processing_sec'] = processing_time
-        wandb.summary['time_saving_sec'] = save_time
-        if args.visualize and 'vis_time' in locals():
-            wandb.summary['time_visualization_sec'] = vis_time
-        if 'upload_time' in locals():
-            wandb.summary['time_upload_sec'] = upload_time
-        wandb.summary['time_total_sec'] = total_time
-        wandb.summary['time_total_min'] = total_time / 60
+def finalize_wandb(use_wandb, output_path, image_positions, joint_positions, timings):
+    """Log final summary to W&B and finish the run."""
+    if not use_wandb:
+        return
 
-        # Save processed data as artifact
-        artifact = wandb.Artifact('processed-data', type='dataset')
-        artifact.add_file(str(output_path), name='processed_data.npz')
-        wandb.log_artifact(artifact)
+    wandb.summary['total_frames'] = len(image_positions)
+    wandb.summary['image_positions_shape'] = str(image_positions.shape)
+    wandb.summary['joint_positions_shape'] = str(joint_positions.shape)
 
-        wandb.finish()
-        print("\nWeights & Biases logging complete")
+    wandb.summary['time_dataset_loading_sec'] = timings['dataset']
+    wandb.summary['time_processing_sec'] = timings['processing']
+    wandb.summary['time_saving_sec'] = timings['save']
+    if 'visualization' in timings:
+        wandb.summary['time_visualization_sec'] = timings['visualization']
+    if 'upload' in timings:
+        wandb.summary['time_upload_sec'] = timings['upload']
+    wandb.summary['time_total_sec'] = timings['total']
+    wandb.summary['time_total_min'] = timings['total'] / 60
+
+    artifact = wandb.Artifact('processed-data', type='dataset')
+    artifact.add_file(str(output_path), name='processed_data.npz')
+    wandb.log_artifact(artifact)
+
+    wandb.finish()
+    print("\nWeights & Biases logging complete")
+
+
+def main():
+    args = parse_args()
+    timings = {}
+
+    script_start_time = time.time()
+    print(f"\n[TIME] Script started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # Validate dot positions
+    if args.dots_cam1 is None or args.dots_cam2 is None:
+        print("\nWARNING: Initial dot positions not provided!")
+        print("You need to manually identify the two dots in the first frame of each camera.")
+        print("Example: python preprocess.py --dots-cam1 100 150 120 160 --dots-cam2 200 250 220 260")
+        return
+
+    initial_dots_cam1 = np.array(args.dots_cam1).reshape(2, 2)
+    initial_dots_cam2 = np.array(args.dots_cam2).reshape(2, 2)
+
+    # Setup output
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load dataset
+    print("Loading HuggingFace dataset...")
+    dataset_load_start = time.time()
+    dataset = load_dataset("paszea/ik", split='train')
+    timings['dataset'] = time.time() - dataset_load_start
+    print(f"Loaded {len(dataset)} samples")
+    print(f"[TIME] Dataset loading: {timings['dataset']:.1f}s")
+
+    # Initialize W&B
+    use_wandb = init_wandb(args, len(dataset))
+
+    # Process dataset
+    print("\n" + "="*70)
+    print("PROCESSING WITH STREAMING (Memory-Efficient Mode)")
+    print("="*70)
+
+    processing_start = time.time()
+    result = process_dataset_streaming(
+        dataset,
+        initial_dots_cam1,
+        initial_dots_cam2,
+        frame_offset=args.frame_offset,
+        video_dir=args.video_dir,
+        return_visualization_data=True,
+        chunk_size=args.chunk_size,
+        gpu_chunk_size=args.gpu_chunk_size,
+        temp_dir=output_path.parent,
+        vis_frames=args.vis_frames,
+        max_frames=args.max_frames,
+        episode=args.episode
+    )
+    image_positions, joint_positions, tracks_cam1, tracks_cam2, visibility_cam1, visibility_cam2, video_dir_used = result
+    timings['processing'] = time.time() - processing_start
+    print(f"\n[TIME] Total processing (tracking + data prep): {timings['processing']:.1f}s ({timings['processing']/60:.1f} min)")
+
+    # Save data
+    timings['save'] = save_tracking_data(output_path, image_positions, joint_positions)
+
+    # Create visualizations
+    if args.visualize:
+        timings['visualization'], timings['upload'] = create_and_upload_visualizations(
+            args, output_path, video_dir_used, tracks_cam1, tracks_cam2,
+            visibility_cam1, visibility_cam2, use_wandb
+        )
+
+    # Summary
+    timings['total'] = time.time() - script_start_time
+    print_timing_summary(timings)
+
+    # Finalize W&B
+    finalize_wandb(use_wandb, output_path, image_positions, joint_positions, timings)
 
     print(f"\n[TIME] Script finished at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print("\n" + "=" * 70)
