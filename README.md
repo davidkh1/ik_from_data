@@ -33,7 +33,8 @@ python inference.py \
 
 ## Overview
 
-The SO-100 robot arm costs $110 and has no fancy features - you control it by setting its 6 joint positions. This project adds simplified IK by:
+You control the SO-100 robot arm by setting its 6 joint positions. 
+This project adds simplified IK by:
 
 1. Physically marking the gripper jaws with two dots
 2. Recording videos and joint positions while moving the arm
@@ -186,11 +187,12 @@ ik_from_data/
 - **Normalization**: Z-score (inputs + outputs)
 - **Memory**: Streaming architecture prevents OOM (~1-2 GB RAM vs ~15-20 GB)
 
-## Citation
+## References
 
 - Dataset: https://huggingface.co/datasets/paszea/ik
 - CoTracker: https://github.com/facebookresearch/co-tracker
 
-## License
+## Current Technical Problems
+The issue with the initial dot positions is that CoTracker3 loses track of these small
+blue dots over time as the gripper moves.
 
-MIT License

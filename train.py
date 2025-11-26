@@ -109,7 +109,6 @@ def plot_training_history(train_losses, val_losses, save_path):
     plt.grid(True)
     plt.savefig(save_path)
     plt.close()
-    print(f"Training history plot saved to {save_path}")
 
 
 def main():
@@ -190,7 +189,7 @@ def main():
     # Save normalization parameters
     norm_params_path = output_dir / 'normalization_params.json'
     dataset.save_normalization_params(norm_params_path)
-    print(f"Normalization parameters saved to {norm_params_path}")
+    print(f"[SAVED] {norm_params_path}")
 
     # Split dataset
     val_size = int(len(dataset) * args.val_split)
@@ -284,7 +283,7 @@ def main():
         'train_loss': train_losses[-1],
         'val_loss': val_losses[-1],
     }, final_model_path)
-    print(f"\nFinal model saved to {final_model_path}")
+    print(f"\n[SAVED] Models -> {output_dir}/")
 
     # Plot training history
     plot_path = output_dir / 'training_history.png'
@@ -298,7 +297,6 @@ def main():
             'val_losses': val_losses,
             'best_val_loss': best_val_loss,
         }, f, indent=2)
-    print(f"Training history saved to {history_path}")
 
     # Log artifacts and summary to wandb
     if use_wandb:
