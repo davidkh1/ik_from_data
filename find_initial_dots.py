@@ -58,13 +58,24 @@ def view_first_frames():
     axes[1].set_xlabel(f'Width: {first_wrist.shape[1]} pixels')
     axes[1].set_ylabel(f'Height: {first_wrist.shape[0]} pixels')
 
+    # Add grid lines every 25 pixels
+    grid_spacing = 25
+    for ax, frame in [(axes[0], first_front), (axes[1], first_wrist)]:
+        h, w = frame.shape[:2]
+        ax.set_xticks(range(0, w + 1, grid_spacing), minor=True)
+        ax.set_yticks(range(0, h + 1, grid_spacing), minor=True)
+        ax.grid(which='minor', color='yellow', linestyle='-', linewidth=0.3, alpha=0.5)
+        ax.set_xticks(range(0, w + 1, 100))
+        ax.set_yticks(range(0, h + 1, 100))
+        ax.grid(which='major', color='yellow', linestyle='-', linewidth=0.6, alpha=0.7)
+
     plt.tight_layout()
 
     # Save image
     output_file = Path("output/first_frames.png")
     output_file.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
-    print(f"\n[OK] First frames saved to: {output_file}")
+    print(f"\n[SAVED] {output_file}")
 
     # Show plot
     try:
